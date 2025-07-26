@@ -269,14 +269,14 @@ where
                     MarketError::TxnConfirmationError(e) => {
                         OrderMonitorErr::LockTxNotConfirmed(e.to_string())
                     }
-                    MarketError::LockRevert(e) => {
+                    MarketError::LockRevert(tx_hash, reason) => { // <-- Şimdi iki alanı da yakalıyoruz: tx_hash (B256) ve reason (String)
                         // Note: lock revert could be for any number of reasons;
                         // 1/ someone may have locked in the block before us,
                         // 2/ the lock may have expired,
                         // 3/ the request may have been fulfilled,
                         // 4/ the requestor may have withdrawn their funds
                         // Currently we don't have a way to determine the cause of the revert.
-                        OrderMonitorErr::LockTxFailed(format!("Tx hash 0x{e:x}"))
+                        OrderMonitorErr::LockTxFailed(format!("Tx hash 0x{:x}, Revert Reason: {}", tx_hash, reason)) // Hem hash'i hem nedeni formatla
                     }
                     MarketError::Error(e) => {
                         // Insufficient balance error is thrown both when the requestor has insufficient balance,

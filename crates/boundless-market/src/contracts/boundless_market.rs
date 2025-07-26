@@ -87,8 +87,8 @@ pub enum MarketError {
     RequestAlreadyLocked(U256),
 
     /// Lock request reverted, possibly outbid.
-    #[error("Lock request reverted, possibly outbid: txn_hash: {0}")]
-    LockRevert(B256),
+    #[error("Lock request reverted: txn_hash: {0}, reason: {1}")]
+    LockRevert(B256, String), // B256 (TxHash) ve hata mesajı (String)
 
     /// General market error.
     #[error("Other error: {0:?}")]
@@ -102,7 +102,24 @@ pub enum MarketError {
 impl From<alloy::contract::Error> for MarketError {
     fn from(err: alloy::contract::Error) -> Self {
         tracing::debug!("raw alloy contract error: {:?}", err);
-        MarketError::Error(TxnErr::from(err).into())
+        match err {
+            // Eğer bir TransportError ise ve içinde RPC hata yanıtı varsa (genellikle revert'ler burada gelir)
+            alloy::contract::Error::TransportError(transport_err) => {
+                if let Some(error_resp) = transport_err.as_error_resp() {
+                    let mut message = format!("RPC Error (code: {}): {}", error_resp.code, error_resp.message);
+                    if let Some(revert_data) = error_resp.as_revert_data() {
+                        // Eğer RPC yanıtında revert data varsa, onu da ekle.
+                        message.push_str(&format!(" - Revert Data: 0x{}", alloy_primitives::hex::encode(&revert_data)));
+                    }
+                    MarketError::Error(anyhow::anyhow!("RPC Transport Error: {}", message))
+                } else {
+                    // Diğer TransportError durumları (örn. ağ bağlantısı sorunları)
+                    MarketError::Error(anyhow::anyhow!("Transport Error: {:?}", transport_err))
+                }
+            }
+            // Diğer tüm AlloyContractError'lar için genel bir dönüşüm.
+            _ => MarketError::Error(anyhow::anyhow!("Alloy Contract Error: {:?}", err)),
+        }
     }
 }
 
@@ -423,24 +440,61 @@ impl<P: Provider> BoundlessMarketService<P> {
                 .max_priority_fee_per_gas(priority_fee.max_priority_fee_per_gas + gas as u128);
         }
 
-        tracing::trace!("Sending tx {}", format!("{:?}", call));
+        tracing::info!("Sending tx {}", format!("{:?}", call));
         let pending_tx = call.send().await?;
 
         let tx_hash = *pending_tx.tx_hash();
-        tracing::trace!("Broadcasting lock request tx {}", tx_hash);
+        tracing::info!("Broadcasting lock request tx {}", tx_hash);
 
         let receipt = self.get_receipt_with_retry(pending_tx).await?;
 
         if !receipt.status() {
-            // TODO: Get + print revertReason
-            return Err(MarketError::LockRevert(receipt.transaction_hash));
+            // İşlem zincirde geri döndüyse (revert olduysa), nedenini almaya çalışıyoruz.
+            // Bunun için aynı `call` nesnesini kullanarak işlemi "simüle ediyoruz" (call.call().await).
+            // Bu, RPC nodun kontratın geri dönüş verisini döndürmesini sağlar.
+            let revert_reason = match call.call().await {
+                Ok(_) => {
+                    // Bu senaryo nadirdir: İşlem zincirde revert oldu, ancak simülasyon başarılı döndü.
+                    "Unknown revert reason: Transaction reverted on chain but call simulation succeeded (possible race condition or state change)".to_string()
+                }
+                Err(e) => {
+                    // AlloyContractError'dan geri dönüş nedenini çıkarmaya çalışıyoruz.
+                    match e {
+                        alloy::contract::Error::TransportError(transport_err) => {
+                            // RPC sağlayıcısından gelen hata yanıtını kontrol et.
+                            if let Some(error_payload) = transport_err.as_error_resp() {
+                                let mut reason = format!("RPC Error (code: {}): {}", error_payload.code, error_payload.message);
+                                if let Some(revert_data) = error_payload.as_revert_data() {
+                                    // Ham revert data'yı hex olarak ekle.
+                                    // Buraya isterseniz alloy_sol_types::SolInterface::abi_decode(&revert_data) ile
+                                    // daha spesifik kontrat hatalarını çözümleme mantığı ekleyebilirsiniz.
+                                    reason.push_str(&format!(" - Revert Data: 0x{}", alloy_primitives::hex::encode(&revert_data)));
+                                }
+                                reason
+                            } else {
+                                // Transport hatasının genel açıklaması.
+                                format!("Transport Error: {:?}", transport_err)
+                            }
+                        },
+                        // AlloyContractError::Revert varyantını kaldırdık
+                        _other_error => {
+                            // Diğer Alloy kontrat hata türleri için genel bir yakalama.
+                            // Örneğin, AbiError, PendingTransactionError vb.
+                            format!("Contract Call Error: {:?}", _other_error)
+                        }
+                    }
+                }
+            };
+
+            // Elde edilen hata mesajını logla ve MarketError::LockRevert olarak geri döndür.
+            tracing::info!(
+                "Lock request reverted for transaction {}: {}",
+                receipt.transaction_hash,
+                revert_reason
+            );
+            return Err(MarketError::LockRevert(receipt.transaction_hash, revert_reason));
         }
 
-        tracing::info!(
-            "Locked request {:x}, transaction hash: {}",
-            request.id,
-            receipt.transaction_hash
-        );
 
         self.check_stake_balance().await?;
 
@@ -486,15 +540,49 @@ impl<P: Provider> BoundlessMarketService<P> {
 
         let receipt = self.get_receipt_with_retry(pending_tx).await?;
         if !receipt.status() {
-            // TODO: Get + print revertReason
-            return Err(MarketError::LockRevert(receipt.transaction_hash));
-        }
+            // İşlem zincirde geri döndüyse (revert olduysa), nedenini almaya çalışıyoruz.
+            // Bunun için aynı `call` nesnesini kullanarak işlemi "simüle ediyoruz" (call.call().await).
+            // Bu, RPC nodun kontratın geri dönüş verisini döndürmesini sağlar.
+            let revert_reason = match call.call().await {
+                Ok(_) => {
+                    // Bu senaryo nadirdir: İşlem zincirde revert oldu, ancak simülasyon başarılı döndü.
+                    "Unknown revert reason: Transaction reverted on chain but call simulation succeeded (possible race condition or state change)".to_string()
+                }
+                Err(e) => {
+                    // AlloyContractError'dan geri dönüş nedenini çıkarmaya çalışıyoruz.
+                    match e {
+                        alloy::contract::Error::TransportError(transport_err) => {
+                            // RPC sağlayıcısından gelen hata yanıtını kontrol et.
+                            if let Some(error_payload) = transport_err.as_error_resp() {
+                                let mut reason = format!("RPC Error (code: {}): {}", error_payload.code, error_payload.message);
+                                if let Some(revert_data) = error_payload.as_revert_data() {
+                                    // Ham revert data'yı hex olarak ekle.
+                                    // Buraya isterseniz alloy_sol_types::SolInterface::abi_decode(&revert_data) ile
+                                    // daha spesifik kontrat hatalarını çözümleme mantığı ekleyebilirsiniz.
+                                    reason.push_str(&format!(" - Revert Data: 0x{}", alloy_primitives::hex::encode(&revert_data)));
+                                }
+                                reason
+                            } else {
+                                // Transport hatasının genel açıklaması.
+                                format!("Transport Error: {:?}", transport_err)
+                            }
+                        },
+                        // AlloyContractError::Revert varyantını kaldırdık
+                        _other_error => {
+                            // Diğer Alloy kontrat hata türleri için genel bir yakalama.
+                            // Örneğin, AbiError, PendingTransactionError vb.
+                            format!("Contract Call Error: {:?}", _other_error)
+                        }
+                    }
+                }
+            };
 
-        tracing::info!(
-            "Locked request {:x}, transaction hash: {}",
-            request.id,
-            receipt.transaction_hash
-        );
+            tracing::info!(
+                "Locked request {:x}, transaction hash: {}",
+                request.id,
+                receipt.transaction_hash
+            );
+        }
 
         Ok(receipt.block_number.context("TXN Receipt missing block number")?)
     }
