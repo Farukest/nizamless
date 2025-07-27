@@ -16,7 +16,7 @@ balance_warn_threshold = "0.015"
 balance_error_threshold = "0.01"
 stake_balance_warn_threshold = "4"
 stake_balance_error_threshold = "3"
-min_lock_out_time = 14
+min_lock_out_time = 40
 # If enabled, the order will be preflighted without constraints.
 priority_requestor_addresses = [
     "0x734df7809c4ef94da037449c287166d114503198",
